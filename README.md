@@ -31,12 +31,8 @@ Claude'a sadece *"şu şarkıyı stem'lerine ayır"* demen yeterli. Gerisini ski
   25–63 ms iken tempo haritasıyla 11–12 ms.
 - Notalar 1/16'lık grid'e oturtulur. Şarkının tonu bulunup MIDI'ye yazılır. Bas ve ana vokal tek sesli çıkar.
 - Davul MIDI'si General MIDI notalarındadır (kick 36, snare 38, hi-hat 42...), her davul VST'sine uyar.
-- **Yanlış nota yerine eksik nota:** Sesin açıkça onaylamadığı notalar atılır. Her MIDI izi bağımsız bir
-  yöntemle kendi stem'ine karşı kontrol edilir; **doğruluk** ve **kapsama** `_kontrol.txt`'ye yazılır.
-- `00_Tum_Enstrumanlar.mid` dosyasına sadece doğruluğu %95 ve üstü olan izler girer. Test şarkısında
-  ana vokal %97.4, arka vokal %95.9, davul %97.3 ve bas %99.7 bu sınırı geçti. Gitar (%94.4) ve synth pad
-  (%90.3) ayrı dosya olarak verildi, "güvenilmez" diye işaretlendi. Akorlu karışık seslerde otomatik MIDI'nin
-  sınırı budur.
+- MIDI otomatik transkripsiyondur: bas, vokal melodisi ve davulda iyi sonuç verir, yoğun akorlarda hata yapabilir.
+  Her MIDI'nin kendi stem'iyle "uyum %" puanı `_kontrol.txt`'ye yazılır.
 - Şarkıda olmayan enstrümanların boş dosyaları **otomatik silinir**.
 - Her iş sonunda tüm dosyalar **otomatik kontrol edilir**: süre, örnekleme hızı, seviye, clipping ve
   vokal+enstrümantal toplamının orijinali ne kadar verdiği. Rapor klasöre `_kontrol.txt` olarak yazılır.
