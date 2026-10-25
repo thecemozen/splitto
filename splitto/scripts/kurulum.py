@@ -4,6 +4,7 @@ Stem ayırma ortamını kurar (bir kez çalıştırılır, sonra tekrar gerekmez
 - Kullanıcının ev klasöründe kısa yollu bir Python ortamı açar: ~/.stems-venv
   (Windows'ta uzun yollar CUDA DLL'lerini yükletmiyor, bu yüzden kısa yol şart.)
 - audio-separator'ı kurar; NVIDIA ekran kartı varsa CUDA'lı PyTorch'u üstüne koyar.
+- MIDI için Basic Pitch'i kurar (eski kurulumlarda eksikse sadece onu ekler).
 - ffmpeg var mı bakar.
 
 Kullanım:  python kurulum.py            # kurulu ise sadece kontrol eder
@@ -31,6 +32,7 @@ CHECK = (
     "('mps' if getattr(torch.backends, 'mps', None) and torch.backends.mps.is_available() else 'cpu');"
     "print(dev)"
 )
+MIDI_CHECK = "import basic_pitch, pretty_midi, librosa"
 
 
 def run(*cmd: str) -> None:
@@ -70,6 +72,19 @@ def install() -> None:
         pip("--force-reinstall", "--no-deps", "torch", "torchaudio", "torchvision", "--index-url", CUDA_INDEX)
 
 
+def ensure_midi() -> None:
+    """MIDI çıkarma paketleri (Basic Pitch). Eski kurulumlara da sonradan eklenir."""
+    if subprocess.run([str(PY), "-c", MIDI_CHECK], capture_output=True).returncode == 0:
+        return
+    print("MIDI paketleri kuruluyor (Basic Pitch)")
+    # basic-pitch Windows/Linux'ta tensorflow istiyor ama hazır gelen ONNX modeliyle onsuz çalışıyor;
+    # tensorflow'u (~500 MB) indirmemek için bağımlılıkları elle kur.
+    pip("--no-deps", "basic-pitch==0.4.0")
+    pip("pretty_midi", "mir_eval", "resampy<0.4.3", "librosa", "scikit-learn", "typing-extensions")
+    if subprocess.run([str(PY), "-c", MIDI_CHECK], capture_output=True).returncode != 0:
+        sys.exit("MIDI paketleri doğrulanamadı.")
+
+
 def main() -> None:
     sys.stdout.reconfigure(encoding="utf-8")  # Windows konsolunda Türkçe karakterler bozulmasın
     ap = argparse.ArgumentParser()
@@ -87,6 +102,7 @@ def main() -> None:
             sys.exit("Kurulum doğrulanamadı: ortam içinde audio_separator/torch import edilemiyor.")
     else:
         print(f"Ortam zaten kurulu: {VENV}")
+    ensure_midi()
 
     print(f"Hesaplama aygıtı: {dev}" + ("  (ekran kartı yok, CPU ile 4-10 kat yavaş olur)" if dev == "cpu" else ""))
     if not shutil.which("ffmpeg"):

@@ -6,10 +6,11 @@ Akış (her adım bir öncekinin çıktısını işler):
   2) Mel-RoFormer Karaoke -> Vokal içinden Ana Vokal + Arka Vokal
   3) Demucs htdemucs_6s   -> Enstrümantal içinden Davul, Bas, Gitar, Piyano, Diğer (synth/pad/yaylı)
   4) MDX23C DrumSep       -> Davul içinden Kick, Snare, Tom, Hi-Hat, Ride, Crash
-Son olarak: sessiz (şarkıda olmayan) stem'ler silinir, kalanlar kontrol edilip _kontrol.txt yazılır.
+Son olarak: sessiz (şarkıda olmayan) stem'ler silinir, kalanlar kontrol edilip _kontrol.txt yazılır,
+kalan stem'lerden MIDI çıkarılır (MIDI/ klasörü, bkz. midi_cikar.py) ve o da kontrol edilir.
 
 Kullanım:
-  python stems.py şarkı.wav [başka.mp3 klasör/ ...] [--cikti KLASÖR] [--mod tam|hizli|vokal] [--sessizleri-tut]
+  python stems.py şarkı.wav [başka.mp3 klasör/ ...] [--cikti KLASÖR] [--mod tam|hizli|vokal] [--sessizleri-tut] [--midi-yok]
     --mod tam    : 4 adımın hepsi (varsayılan)
     --mod hizli  : davul seti parçalanmaz (1-3)
     --mod vokal  : sadece vokal + enstrümantal (1)
@@ -151,10 +152,10 @@ def verify(song: Path, dest: Path, keep_silent: bool) -> bool:
     return ok
 
 
-def process(song: Path, sep: Separator, mode: str, out_root: Path | None, keep_silent: bool) -> bool:
+def process(song: Path, sep: Separator, mode: str, out_root: Path | None, keep_silent: bool, midi: bool) -> bool:
     dest = (out_root or song.parent) / f"{song.stem} - Stems"
     dest.mkdir(parents=True, exist_ok=True)
-    for old in dest.glob("*.wav"):  # yeniden çalıştırmada eski sonuçlar karışmasın
+    for old in [*dest.glob("*.wav"), *dest.glob("MIDI/*.mid")]:  # yeniden çalıştırmada eski sonuçlar karışmasın
         old.unlink()
     t0 = time.time()
     print(f"\n=== {song.name} -> {dest}")
@@ -187,7 +188,24 @@ def process(song: Path, sep: Separator, mode: str, out_root: Path | None, keep_s
                 run_model(sep, MODEL_DRUMS, inst["drums"], work, NAMES_DRUMS, dest)
 
     print(f"--- Ayırma bitti ({time.time() - t0:.0f} sn). Kontrol:")
-    return verify(song, dest, keep_silent)
+    ok = verify(song, dest, keep_silent)
+
+    if midi:  # boş stem'ler silindikten sonra, kalanlardan MIDI çıkar
+        import midi_cikar
+
+        print("--- MIDI çıkarılıyor")
+        midi_cikar.extract(dest)
+        try:
+            duration = sf.info(str(song)).duration
+        except Exception:
+            duration = None
+        lines, midi_ok = midi_cikar.verify(dest, duration)
+        report = "\n".join(lines)
+        with open(dest / "_kontrol.txt", "a", encoding="utf-8") as f:
+            f.write(report + f"\nMIDI sonucu: {'TAMAM' if midi_ok else 'SORUN VAR'}\n")
+        print(report)
+        ok = ok and midi_ok
+    return ok
 
 
 def collect(inputs: list[str]) -> list[Path]:
@@ -210,6 +228,7 @@ def main() -> None:
     ap.add_argument("--cikti", help="Çıktı ana klasörü (varsayılan: şarkının yanı)")
     ap.add_argument("--mod", choices=["tam", "hizli", "vokal"], default="tam")
     ap.add_argument("--sessizleri-tut", action="store_true", help="Boş stem'leri silme")
+    ap.add_argument("--midi-yok", action="store_true", help="MIDI çıkarma")
     args = ap.parse_args()
 
     songs = collect(args.girdi)
@@ -224,7 +243,7 @@ def main() -> None:
     results = {}
     for song in songs:
         try:
-            results[song.name] = process(song, sep, args.mod, out_root, args.sessizleri_tut)
+            results[song.name] = process(song, sep, args.mod, out_root, args.sessizleri_tut, not args.midi_yok)
         except Exception as e:  # bir şarkı patlarsa diğerlerine devam et
             print(f"HATA ({song.name}): {e}")
             results[song.name] = False

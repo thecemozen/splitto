@@ -1,10 +1,11 @@
 # Splitto — Vocal Stems Splitter
 
-Şarkıları kendi bilgisayarında, ücretsiz olarak vokal ve enstrüman katmanlarına (stem) ayıran bir **Claude skill'i**.
-Suno'nun "Extract Stems" özelliği, UVR veya LALAL.AI gibi, ama tamamen yerel çalışır.
+Şarkıları kendi bilgisayarında, ücretsiz olarak vokal ve enstrüman katmanlarına (stem) ayıran ve her birinin
+**MIDI**'sini çıkaran bir **Claude skill'i**. Suno'nun "Extract Stems and MIDI" özelliği, UVR veya LALAL.AI gibi,
+ama tamamen yerel çalışır.
 
-Claude'a sadece *"şu şarkıyı stem'lerine ayır"* demen yeterli. Gerisini skill halleder: kurulum, ayırma, boş
-stem'leri silme ve her çıktıyı kontrol etme.
+Claude'a sadece *"şu şarkıyı stem'lerine ayır"* demen yeterli. Gerisini skill halleder: kurulum, ayırma, MIDI
+çıkarma, boş stem'leri silme ve her çıktıyı kontrol etme.
 
 ## Ne çıkarır?
 
@@ -21,7 +22,17 @@ stem'leri silme ve her çıktıyı kontrol etme.
 | `07_Diger_Synth_Pad.wav` | Synth, pad, yaylı ve kalan her şey |
 | `08`–`13_Davul_*.wav` | Kick, Snare, Tom, Hi-Hat, Ride, Crash |
 
+| `MIDI/*.mid` | Her stem'in MIDI'si: vokal melodisi, bas hattı, gitar/piyano/synth notaları, davul ritmi |
+| `MIDI/00_Tum_Enstrumanlar.mid` | Bütün MIDI izleri tek dosyada |
+
 - Çıktılar orijinalle **aynı örnekleme hızında ve uzunlukta** olur. DAW'a sürükleyince birebir hizalanırlar.
+- MIDI'ye şarkının **tempo haritası** yazılır. Tempo şarkı boyunca kaysa bile (Suno şarkılarında sık görülür)
+  DAW'ın grid'i gerçek vuruşlara oturur: test şarkısında davul vuruşlarının grid'e uzaklığı sabit tempoda
+  25–63 ms iken tempo haritasıyla 11–12 ms.
+- Notalar 1/16'lık grid'e oturtulur. Şarkının tonu bulunup MIDI'ye yazılır. Bas ve ana vokal tek sesli çıkar.
+- Davul MIDI'si General MIDI notalarındadır (kick 36, snare 38, hi-hat 42...), her davul VST'sine uyar.
+- MIDI otomatik transkripsiyondur: bas, vokal melodisi ve davulda iyi sonuç verir, yoğun akorlarda hata yapabilir.
+  Her MIDI'nin kendi stem'iyle "uyum %" puanı `_kontrol.txt`'ye yazılır.
 - Şarkıda olmayan enstrümanların boş dosyaları **otomatik silinir**.
 - Her iş sonunda tüm dosyalar **otomatik kontrol edilir**: süre, örnekleme hızı, seviye, clipping ve
   vokal+enstrümantal toplamının orijinali ne kadar verdiği. Rapor klasöre `_kontrol.txt` olarak yazılır.
@@ -56,7 +67,8 @@ python splitto/scripts/kurulum.py
 %USERPROFILE%\.stems-venv\Scripts\python.exe splitto\scripts\stems.py "şarkı.wav"   # Windows
 ```
 
-Seçenekler: `--mod tam|hizli|vokal`, `--cikti KLASÖR`, `--sessizleri-tut`.
+Seçenekler: `--mod tam|hizli|vokal`, `--cikti KLASÖR`, `--sessizleri-tut`, `--midi-yok`.
+Zaten ayrılmış bir klasörden sadece MIDI çıkarmak için: `python splitto/scripts/midi_cikar.py "<şarkı> - Stems"`.
 Windows'ta ses dosyalarını [`windows/Splitto.bat`](windows/Splitto.bat) üzerine sürükleyip bırakmak da yeterli.
 
 ## Kullanılan modeller
@@ -69,6 +81,7 @@ Windows'ta ses dosyalarını [`windows/Splitto.bat`](windows/Splitto.bat) üzeri
 | Ana / arka vokal | Mel-RoFormer Karaoke (aufr33 & viperx) |
 | Enstrümanlar | Demucs v4 `htdemucs_6s` (Meta) |
 | Davul seti | MDX23C DrumSep (aufr33 & jarredou) |
+| MIDI | [Basic Pitch](https://github.com/spotify/basic-pitch) (Spotify), pYIN (librosa), librosa vuruş/tempo tespiti |
 
 Modellerin her birinin kendi lisansı vardır. Ayırdığın şarkıların haklarına sahip olduğundan emin ol.
 
