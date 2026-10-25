@@ -25,13 +25,22 @@ MIDI ayrıntıları (kullanıcı sorarsa):
   Klip olarak mevcut bir projeye sürüklendiğinde bazı DAW'lar tempo değişimlerini yok sayar; o zaman proje
   temposunu ortalamaya ayarlamak gerekir ve sona doğru küçük kayma olabilir.
 - **Ton:** Şarkının tonu bulunur (ör. E majör), MIDI'ye yazılır. İki perde arasında kalan sesler tona uyan notaya yuvarlanır.
+- **İlke: yanlış nota, kaçırılan notadan kötüdür.** Kullanıcılar MIDI'yi çoğu zaman bir oynatıcıda General MIDI
+  sesleriyle dinler ve her yanlış nota açıkça duyulur. Bu yüzden sesin açıkça onaylamadığı notalar atılır.
+  MIDI eksik olabilir ama içindeki notalar doğru olmalı.
 - **Yöntemler:** Her stem için yöntem, gerçek bir şarkıda yan yana ölçülerek seçildi:
   - Bas: pYIN perde takibi. Oktav hatası yapmaz, tekrarlanan notaları vuruşlardan böler.
-  - Ana vokal: Basic Pitch, aynı anda tek nota.
-  - Arka vokal, gitar, piyano, synth: Basic Pitch, akorlu. Tona uymayan kısa ve zayıf notalar atılır.
+  - Ana vokal: Basic Pitch, varsayılan eşikler, aynı anda tek nota. Eşikleri gevşetmek nefes ve kaymalardan
+    yanlış notalar ekliyor. Ayrıca kısa olup komşularından çok uzak duran kayma notaları atılır.
+  - Arka vokal, gitar, piyano, synth: Basic Pitch. Sadece o anın en güçlü 2 perdesinden biri olan notalar kalır.
+  - Bütün melodik notalar bir kanıt filtresinden geçer (CQT): nota o anda sesin baskın perdesi değilse atılır.
 - **Davul:** DrumSep parçalarındaki vuruşlardan üretilir: General MIDI kick 36, snare 38, tom 45, hi-hat 42,
-  ride 51, crash 49. Kick/snare'den sızan zayıf vuruşlar elenir. `--mod hizli` ve `--mod vokal`'da davul
-  parçalanmadığı için davul MIDI'si çıkmaz.
+  ride 51, crash 49. Her parça kendi seviye eşiğinden geçer. Kick/snare'den sızan vuruşlar ve bir vuruştan sık
+  gelen crash'ler atılır. Doğrulanamayan davul parçası (çoğu zaman crash) davul MIDI'sinden tamamen çıkarılır.
+  `--mod hizli` ve `--mod vokal`'da davul parçalanmadığı için davul MIDI'si çıkmaz.
+- **Güvenilir izler:** Bağımsız kontrolde doğruluğu %95'in altında kalan izler `00_Tum_Enstrumanlar.mid`'e
+  girmez. Ayrı dosya olarak verilir, raporda "güvenilmez" yazar. Akorlu gitar ve synth pad'ler çoğu zaman bu
+  sınırın altında kalır; bu Basic Pitch modelinin karışık seslerdeki sınırıdır.
 - Her şey 1/16'lık grid'e oturtulur. Swing veya triole dayalı parçalarda grid bunu düzleştirir; kullanıcı ham
   zamanlama isterse `midi_cikar.py "<klasör>" --ham` ile yeniden çıkar.
 - MIDI otomatik transkripsiyondur, nota nota kusursuz değildir. En iyi sonuç bas, vokal melodisi ve davulda alınır;
@@ -81,8 +90,12 @@ Script her şarkının sonunda bu işleri kendisi yapar:
 - Kalan her dosyanın süresini ve örnekleme hızını orijinalle karşılaştırır, clipping'e bakar.
 - Vokal + enstrümantal toplamının orijinali ne kadar verdiğini ölçer (-20 dB'den düşük fark = iyi).
 - Her MIDI dosyasını açıp okur: nota var mı, şarkı süresini aşıyor mu, bas notaları gerçekten pes mi.
-- **Uyum %:** Her MIDI'yi kendi stem'inin sesiyle karşılaştırır (perde içeriği örtüşmesi). %70 üstü iyi,
-  %60 altı "dikkat" olarak işaretlenir. Bas için %60-65 normaldir, çünkü pes seslerde ölçüm daha kabadır.
+- **Doğruluk %:** MIDI dosyası yeniden okunur. Her nota, üretimden bağımsız bir yöntemle kendi stem'ine karşı
+  kontrol edilir: melodilerde STFT harmonik toplamı, davulda o davulun frekans bandındaki enerji sıçraması, crash'te
+  çınlama. Tek sesli izlerde nota o anın baskın perdesi olmalı (±1 yarım ses); akorlu izlerde en güçlü 4 tepe arasında.
+  %95 ve üstü güvenilir sayılır.
+- **Kapsama %:** Stem'in sesli kısımlarının ne kadarının MIDI'ye geçtiği. Doğruluk için not atıldığından düşük
+  olabilir; kullanıcıya ikisini birlikte söyle ki doğruluk, not silerek şişirilmiş gibi görünmesin.
 - **Grid uzaklığı:** Davuldaki gerçek vuruşların MIDI grid'ine medyan uzaklığı. 20 ms altı iyi; üstü tempo
   haritasının tutmadığını gösterir ve sorun sayılır.
 - Raporu çıktı klasörüne `_kontrol.txt` olarak yazar. Script'in çıkış kodu sorun yoksa 0, varsa 1 olur.
@@ -96,8 +109,11 @@ Kullanıcı teknik olmayabilir; sade bir dille yaz:
 - Çıktı klasörünün yeri (mümkünse dosya yöneticisinde aç).
 - Kalan stem'lerin kısa listesi, her biri için bir iki kelime (ör. "Ana vokal, net").
 - Silinen boş stem'ler ve nedeni ("şarkıda piyano olmadığı için boş çıktı, silindi").
-- MIDI: hangi enstrümanların MIDI'si çıktı, tempo (değişiyorsa aralığı), ton, uyum puanları ve hepsi bir arada
-  dosyanın adı. Tempo değişiyorsa DAW'da MIDI'nin tempo haritasını içe almasını söyle.
+- MIDI: hangi enstrümanların MIDI'si çıktı, tempo (değişiyorsa aralığı), ton, her izin doğruluk ve kapsaması.
+  Hepsi bir arada dosyada hangi izler var, hangileri güvenilmez diye dışarıda kaldı ve neden. Tempo değişiyorsa
+  DAW'da MIDI'nin tempo haritasını içe almasını söyle.
+- Ölçümler kulağın yerini tutmaz. Kullanıcı bir izde hâlâ yanlış nota duyuyorsa ona inan, hangi izde ve
+  şarkının neresinde olduğunu sor.
 - Kontrol sonucu: tamam mı, sorun mu?
 
 Ayrımın temiz olup olmadığına kesin kararı ancak dinleyerek verebilirsin; seviyelere bakarak "kusursuz"

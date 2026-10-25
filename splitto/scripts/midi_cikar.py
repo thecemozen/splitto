@@ -9,15 +9,18 @@ Ayrılmış stem'lerden MIDI çıkarır (stems.py tarafından çağrılır, tek 
 4) Çok sesli stem'ler (arka vokal, gitar, piyano, synth): Basic Pitch; tona uymayan kısa ve zayıf notalar atılır.
 5) Davul: DrumSep parçalarındaki vuruş anları -> General MIDI davul notaları; sızıntılar elenir.
 6) Hepsi 1/16'lık grid'e oturtulur (quantize).
-(Yöntem seçimleri gerçek bir şarkıda yan yana ölçülerek yapıldı: uyum ve kaçan nota oranı.)
+7) Sesin açıkça onaylamadığı notalar atılır (kanıt filtresi): yanlış nota kulak için kaçırılan notadan kötü.
+(Yöntem ve eşik seçimleri gerçek bir şarkıda yan yana ölçülerek yapıldı: doğruluk ve kapsama.)
 
-Çıktı: <stem klasörü>/MIDI/  ->  her stem için bir .mid + hepsi bir arada 00_Tum_Enstrumanlar.mid
-Kontrol: her MIDI, kendi stem'inin sesiyle karşılaştırılıp "uyum %" puanı hesaplanır.
+Çıktı: <stem klasörü>/MIDI/  ->  her stem için bir .mid + güvenilir izlerden 00_Tum_Enstrumanlar.mid
+Kontrol: her MIDI, üretimden bağımsız bir yöntemle kendi stem'ine karşı ölçülür (doğruluk %, kapsama %);
+doğruluğu %95'in altındaki izler hepsi-bir-arada dosyaya girmez.
 
 Tek başına:  python midi_cikar.py "<şarkı> - Stems" [--ham]   (--ham: grid'e oturtma)
 """
 import contextlib
 import io
+import json
 import logging
 import sys
 import warnings
@@ -55,6 +58,13 @@ DRUM_NOTES = {
     "12_Davul_Ride": 51,
     "13_Davul_Crash": 49,
 }
+
+# Davul parçasının en güçlü vuruşlarına göre en düşük kabul edilen seviye (0-1)
+DRUM_FLOOR = {"08_Davul_Kick": 0.2, "09_Davul_Snare": 0.25, "11_Davul_HiHat": 0.6, "13_Davul_Crash": 0.45, "diger": 0.45}
+
+# Bağımsız kontrolde doğruluğu bunun altında kalan izler "hepsi bir arada" dosyaya girmez
+# (ayrı dosya olarak verilir, raporda işaretlenir). Kulak için yanlış nota kaçırılan notadan kötü.
+RELIABLE = 0.95
 
 KEY_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
 # Krumhansl-Kessler ton profilleri
@@ -289,11 +299,12 @@ def monophonic(events: list) -> list:
 
 
 def mono_bp_notes(wav: Path, fmin: float, fmax: float, model) -> list:
-    """Vokal melodisi: biraz gevşek eşikler (kaçan nota az) + aynı anda tek nota."""
+    """Vokal melodisi: varsayılan eşikler + aynı anda tek nota. (Eşikleri gevşetmek kaçan notayı azaltıyor ama
+    nefes ve kaymalardan yanlış notalar ekliyor; kulak için yanlış nota daha kötü.)"""
     from basic_pitch.inference import predict
 
     with _quiet():
-        _, _, events = predict(str(wav), model, onset_threshold=0.4, frame_threshold=0.25, minimum_note_length=90,
+        _, _, events = predict(str(wav), model, minimum_note_length=120,
                                minimum_frequency=fmin, maximum_frequency=fmax)
     return [(s, e, int(p), int(np.clip(30 + a * 97, 1, 127))) for s, e, p, a in monophonic(events)]
 
@@ -321,6 +332,60 @@ def poly_notes(wav: Path, fmin: float, fmax: float, song: Song, model) -> list:
     return notes
 
 
+# ---------------------------------------------------------------- kanıt filtresi
+# Kulak için yanlış bir nota, kaçırılan bir notadan çok daha kötü. Sesin açıkça onaylamadığı notalar atılır.
+# Filtre CQT (tek frekans kutusu) kullanır; kontrol (melodic_scores) ise farklı bir yöntemle, STFT harmonik toplamıyla ölçer.
+
+def _cqt_db(wav: Path) -> np.ndarray:
+    import librosa
+
+    y = _load(wav)
+    C = np.abs(librosa.cqt(y, sr=SR, hop_length=HOP, fmin=librosa.midi_to_hz(24), n_bins=85, bins_per_octave=12))
+    db = librosa.amplitude_to_db(C, ref=np.max)
+    return db - db.max(axis=0, keepdims=True)
+
+
+def evidence_filter(wav: Path, notes: list, mono: bool, rank: int = 3, floor_db: float = -15, frac: float = 0.6,
+                    D: np.ndarray | None = None) -> list:
+    D = _cqt_db(wav) if D is None else D
+    n = D.shape[1]
+    kept = []
+    for note in notes:
+        s, e, p = note[0], note[1], note[2]
+        a = int(np.clip(s * SR / HOP, 0, n - 1))
+        b = int(np.clip(e * SR / HOP, a + 1, n))
+        i = p - 24
+        if not 0 < i < D.shape[0] - 1:
+            continue
+        seg = D[:, a:b]
+        if mono:
+            top = seg.argmax(axis=0)
+            # baskın perde bu nota, ya da bir oktav üstü (pes seslerde 2. harmonik temelden güçlü olabiliyor)
+            hit = (np.abs(top - i) <= 1) | ((np.abs(top - i - 12) <= 1) & (seg[i] > -10))
+        else:
+            local = (seg[i] >= np.maximum(seg[i - 1], seg[i + 1])) & (seg[i] > floor_db)
+            peaks = (seg[1:-1] >= seg[:-2]) & (seg[1:-1] >= seg[2:])
+            stronger = np.sum(peaks & (seg[1:-1] > seg[i][None, :]), axis=0)
+            hit = local & (stronger < rank)
+        if np.mean(hit) >= frac:
+            kept.append(note)
+    return kept
+
+
+def drop_glitches(notes: list, song: Song) -> list:
+    """Tek seste: kısa olup hem önceki hem sonraki notadan çok uzak (> 7 yarım ses) duran notalar kaymadır, atılır."""
+    notes = sorted(notes)
+    out = []
+    for k, nt in enumerate(notes):
+        short = nt[1] - nt[0] < 2 * song.step
+        prev = notes[k - 1][2] if k > 0 else None
+        nxt = notes[k + 1][2] if k + 1 < len(notes) else None
+        far = all(x is None or abs(nt[2] - x) > 7 for x in (prev, nxt)) and (prev is not None or nxt is not None)
+        if not (short and far):
+            out.append(nt)
+    return out
+
+
 # ---------------------------------------------------------------- davul
 
 def drum_notes(dest: Path, song: Song) -> list:
@@ -343,14 +408,27 @@ def drum_notes(dest: Path, song: Song) -> list:
         win = int(0.03 * 44100)  # vuruştan sonraki 30 ms'nin tepe seviyesi
         peaks = np.array([np.max(np.abs(y[o:o + win])) if o < len(y) else 0.0 for o in onsets])
         ref = np.percentile(peaks, 95) or 1e-9
-        # -16 dB altı vuruşlar büyük ihtimalle başka parçadan sızıntı
-        hits[stem] = [(o / 44100, min(p / ref, 1.0)) for o, p in zip(onsets, peaks) if p / ref >= 0.15]
+        # Parçanın en güçlü vuruşlarına göre zayıf olanlar büyük ihtimalle başka davuldan sızıntı.
+        # Zil ve tom'lar DrumSep'te en çok sızıntı alan kanallar, eşikleri daha yüksek.
+        floor = DRUM_FLOOR.get(stem, DRUM_FLOOR["diger"])
+        hits[stem] = [(o / 44100, min(p / ref, 1.0)) for o, p in zip(onsets, peaks) if p / ref >= floor]
 
-    # Kick/snare vuruşu crash, ride ve tom kanalına sızabiliyor: aynı anda gelen zayıf vuruşları at.
+    def near(t, others, tol=0.03):
+        return len(others) and np.min(np.abs(others - t)) <= tol
+
+    # Kick/snare vuruşu diğer kanallara sızabiliyor: aynı anda gelen, çok güçlü olmayan vuruşları at.
     strong = np.array(sorted(t for s in ("08_Davul_Kick", "09_Davul_Snare") for t, _ in hits.get(s, [])))
-    for stem in ("10_Davul_Tom", "12_Davul_Ride", "13_Davul_Crash"):
-        if stem in hits and len(strong):
-            hits[stem] = [(t, r) for t, r in hits[stem] if r >= 0.5 or np.min(np.abs(strong - t)) > 0.02]
+    for stem, keep_above in (("10_Davul_Tom", 0.7), ("12_Davul_Ride", 0.7), ("13_Davul_Crash", 0.7), ("11_Davul_HiHat", 0.5)):
+        if stem in hits:
+            hits[stem] = [(t, r) for t, r in hits[stem] if r >= keep_above or not near(t, strong)]
+    # Crash bir vuruştan uzun çınlar; bir vuruştan sık gelen crash'ler hi-hat sızıntısıdır: en güçlüsü kalır.
+    if "13_Davul_Crash" in hits:
+        beat = 4 * song.step
+        kept = []
+        for t, r in sorted(hits["13_Davul_Crash"], key=lambda x: -x[1]):
+            if all(abs(t - k) >= beat for k, _ in kept):
+                kept.append((t, r))
+        hits["13_Davul_Crash"] = sorted(kept)
 
     slots = {}  # (perde, grid zamanı) -> en güçlü vuruş; grid'e oturunca çift vuruşlar tekleşir
     for stem, items in hits.items():
@@ -414,19 +492,42 @@ def extract(dest: Path, quantize: bool = True) -> list[Path]:
     if any(v[4] != "pyin" for v in jobs.values()):
         with _quiet():
             model = Model(ICASSP_2022_MODEL_PATH)
-    tracks = []
+    tracks, scores = [], {}
     for stem, (name, program, fmin, fmax, method) in jobs.items():
         wav = dest / f"{stem}.wav"
+        mono = method != "bp_poly"
         if method == "pyin":
             notes = mono_notes(wav, fmin, fmax, song)
         elif method == "bp_mono":
             notes = mono_bp_notes(wav, fmin, fmax, model)
         else:
             notes = poly_notes(wav, fmin, fmax, song, model)
-        tracks.append((stem, _instrument(name, program, tidy(notes, song))))
+        if mono:
+            notes = drop_glitches(evidence_filter(wav, notes, True), song)
+        else:
+            # akorlarda Basic Pitch'in yanlış notası çok: sadece o anın en güçlü 2 perdesinden biri olan notalar kalır
+            notes = evidence_filter(wav, notes, False, rank=2, floor_db=-12, frac=0.7)
+        notes = tidy(notes, song)
+        acc, cov = melodic_scores(wav, notes, mono)
+        scores[stem] = {"dogruluk": acc, "kapsama": cov}
+        tracks.append((stem, _instrument(name, program, notes)))
+
     drums = drum_notes(dest, song)
     if drums:
-        tracks.append(("03_Davul", _instrument("Davul", 0, drums, drum=True)))
+        # her davul parçası ayrı doğrulanır; güvenilmez parçalar (ör. sızıntıdan oluşan crash) davul izinden çıkarılır
+        kept, dropped = [], []
+        for stem, pitch in DRUM_NOTES.items():
+            part = [n for n in drums if n[2] == pitch]
+            if not part:
+                continue
+            acc = drum_scores(dest, part)
+            scores[f"03_Davul/{stem[9:]}"] = {"dogruluk": acc, "vurus": len(part)}
+            (kept if acc >= RELIABLE else dropped).extend(part)
+        if dropped:
+            print(f"   ! davul: güvenilmez parçalar çıkarıldı ({len(dropped)} vuruş)")
+        if kept:
+            scores["03_Davul"] = {"dogruluk": drum_scores(dest, kept)}
+            tracks.append(("03_Davul", _instrument("Davul", 0, sorted(kept), drum=True)))
 
     tracks = sorted((t for t in tracks if t[1].notes), key=lambda t: t[0])
     written = []
@@ -434,37 +535,103 @@ def extract(dest: Path, quantize: bool = True) -> list[Path]:
         path = out / f"{stem}.mid"
         _midi_file(song, [inst]).write(str(path))
         written.append(path)
-        print(f"   + MIDI/{path.name} ({len(inst.notes)} nota)")
-    if tracks:
+        mark = "" if scores[stem]["dogruluk"] >= RELIABLE else "  (güvenilmez, hepsi-bir-arada dosyaya girmedi)"
+        print(f"   + MIDI/{path.name} ({len(inst.notes)} nota, doğruluk %{scores[stem]['dogruluk'] * 100:.1f}){mark}")
+    good = [inst for stem, inst in tracks if scores[stem]["dogruluk"] >= RELIABLE]
+    if good:
         path = out / "00_Tum_Enstrumanlar.mid"
-        _midi_file(song, [inst for _, inst in tracks]).write(str(path))
+        _midi_file(song, good).write(str(path))
         written.append(path)
-        print(f"   + MIDI/{path.name} ({len(tracks)} iz)")
+        print(f"   + MIDI/{path.name} ({len(good)} güvenilir iz)")
+    (out / "_puanlar.json").write_text(json.dumps(scores, ensure_ascii=False, indent=1), encoding="utf-8")
     return written
 
 
 # ---------------------------------------------------------------- kontrol
+# Not üretiminden bağımsız yöntemlerle ölçülür (STFT harmonik toplamı, bant enerjisi), böylece
+# filtrenin kendi kendini "doğrulaması" engellenir.
 
-def match_score(wav: Path, mid: Path) -> float:
-    """Stem sesinin perde içeriği (chroma) ile MIDI notalarının örtüşmesi, 0-1."""
+def _salience(wav: Path):
+    """Her kare ve her MIDI perdesi (24-108) için harmonik toplam (dB, karedeki en güçlü perdeye göre)."""
     import librosa
-    import pretty_midi
 
-    # hop 2'nin kuvveti olmalı; değilse CQT çok yavaşlıyor (3 dakikalık stem başına ~1 dakika)
-    fs = SR / HOP
     y = _load(wav)
-    C = librosa.feature.chroma_cqt(y=y, sr=SR, hop_length=HOP)
+    S = np.abs(librosa.stft(y, n_fft=8192, hop_length=HOP))
+    freqs = librosa.fft_frequencies(sr=SR, n_fft=8192)
+    pitches = np.arange(24, 109)
+    sal = np.zeros((len(pitches), S.shape[1]))
+    for h, w in zip(range(1, 6), (1.0, 0.8, 0.6, 0.5, 0.4)):
+        f = librosa.midi_to_hz(pitches) * h
+        idx = np.clip(np.searchsorted(freqs, f), 0, len(freqs) - 1)
+        sal += w * S[idx]
+    db = librosa.amplitude_to_db(sal, ref=np.max)
     rms = librosa.feature.rms(y=y, hop_length=HOP)[0]
-    roll = pretty_midi.PrettyMIDI(str(mid)).get_piano_roll(fs=fs)
-    n = min(C.shape[1], roll.shape[1], len(rms))
-    M = np.zeros((12, n))
-    for p in range(128):
-        M[p % 12] += roll[p, :n]
-    active = (rms[:n] > np.percentile(rms[:n], 40)) & (M.sum(0) > 0)
-    if not active.any():
+    return db - db.max(axis=0, keepdims=True), rms
+
+
+def melodic_scores(wav: Path, notes: list, mono: bool) -> tuple[float, float]:
+    """(doğruluk, kapsama): doğrulanan nota oranı ve sesin MIDI'ye geçen kısmı.
+    Tek seste nota o anın baskın perdesi olmalı (±1 yarım ses); çok seste en güçlü 4 tepe arasında olmalı."""
+    sal, rms = _salience(wav)
+    n = sal.shape[1]
+    t2f = lambda t: int(np.clip(round(t * SR / HOP), 0, n - 1))  # noqa: E731
+    ok = 0
+    covered = np.zeros(n, dtype=bool)
+    for s, e, p, _ in notes:
+        a, b = t2f(s), max(t2f(e), t2f(s) + 1)
+        covered[a:b] = True
+        i = p - 24
+        if not 0 < i < sal.shape[0] - 1:
+            continue
+        seg = sal[:, a:b]
+        if mono:
+            hit = np.abs(seg.argmax(axis=0) - i) <= 1
+        else:
+            local = (seg[i] >= np.maximum(seg[i - 1], seg[i + 1])) & (seg[i] > -12)
+            # i'den güçlü olan yerel tepe sayısı
+            peaks = (seg[1:-1] >= seg[:-2]) & (seg[1:-1] >= seg[2:])
+            stronger = np.sum(peaks & (seg[1:-1] > seg[i][None, :]), axis=0)
+            hit = local & (stronger < 4)
+        ok += np.mean(hit) >= 0.5
+    loud = rms[:n] > np.percentile(rms[:n], 60)
+    return ok / max(len(notes), 1), float(np.mean(covered[:len(loud)][loud]))
+
+
+DRUM_BANDS = {36: (30, 150), 38: (1500, 5000), 45: (80, 400), 42: (7000, 16000), 51: (4000, 12000), 49: (4000, 16000)}
+
+
+def drum_scores(dest: Path, notes: list) -> float:
+    """Davul doğruluğu: her vuruş anında, tüm davul stem'inde o davulun frekans bandında enerji sıçraması var mı."""
+    import librosa
+
+    src = dest / "03_Davul.wav"
+    if not src.exists() or not notes:
         return 0.0
-    a, b = C[:, :n][:, active], M[:, active]
-    return float(np.mean(np.sum(a * b, 0) / (np.linalg.norm(a, axis=0) * np.linalg.norm(b, axis=0) + 1e-9)))
+    sr, hop = 44100, 256
+    y = _load(src, sr)
+    S = np.abs(librosa.stft(y, n_fft=2048, hop_length=hop)) ** 2
+    freqs = librosa.fft_frequencies(sr=sr, n_fft=2048)
+    bands = {p: 10 * np.log10(S[(freqs >= lo) & (freqs < hi)].sum(0) + 1e-12) for p, (lo, hi) in DRUM_BANDS.items()}
+    n = S.shape[1]
+    ok = 0
+    for s, _, p, _ in notes:
+        f = int(s * sr / hop)
+        e = bands.get(p)
+        if e is None or f < 4 or f + 6 > n:
+            continue
+        if p == 49:
+            # crash uzun çınlar: vuruştan 100-400 ms sonra tiz bant, vuruş öncesinden belirgin yüksek kalmalı
+            # (anlık sıçrama ölçülemez, sürekli çalan hi-hat aynı bantta)
+            post = e[f + 17:f + 70].mean() if f + 70 < n else -np.inf
+            pre = e[max(f - 26, 0):max(f - 3, 1)].mean()
+            ok += post - pre > 2.0
+            continue
+        # vuruştan sonraki 30 ms ile önceki 40 ms (grid kaymasına pay bırakarak ±2 kare tara);
+        # tom ve ride, snare/hi-hat ile aynı bantları paylaştığı için daha büyük sıçrama ister
+        need = 6.0 if p in (45, 51) else 4.0
+        jumps = [e[g:g + 5].max() - e[g - 7:g - 1].mean() for g in range(max(f - 2, 7), min(f + 3, n - 5))]
+        ok += max(jumps, default=0) > need
+    return ok / len(notes)
 
 
 def grid_offset_ms(dest: Path, mid: Path) -> float | None:
@@ -490,7 +657,7 @@ def grid_offset_ms(dest: Path, mid: Path) -> float | None:
 
 
 def verify(dest: Path, duration: float | None) -> tuple[list[str], bool]:
-    """MIDI dosyalarını okur: nota var mı, süre aşımı, bas perdesi, ses uyumu, ritmin grid'e oturması."""
+    """MIDI dosyalarını okur: nota var mı, süre aşımı, bas perdesi, doğruluk/kapsama, ritmin grid'e oturması."""
     import pretty_midi
 
     lines, ok = [], True
@@ -505,7 +672,10 @@ def verify(dest: Path, duration: float | None) -> tuple[list[str], bool]:
         verdict = "iyi" if off <= 20 else "KAYIK (tempo haritası vuruşları tutmuyor)"
         lines.append(f"Davul vuruşlarının MIDI grid'ine uzaklığı: {off:.0f} ms ({verdict})")
         ok = ok and off <= 20
-    lines.append(f"\n{'MIDI':<24} {'Nota':>6} {'Aralık':>9} {'Son':>7} {'Uyum':>6}  Durum")
+    lines.append("\nDoğruluk: MIDI'deki notaların sesçe doğrulanan oranı. Kapsama: stem'in sesli kısımlarının MIDI'ye geçen oranı.")
+    lines.append(f"{'MIDI':<24} {'Nota':>6} {'Aralık':>9} {'Doğruluk':>9} {'Kapsama':>8}  Durum")
+    mono_stems = {s for s, v in [*MELODIC.items(), FALLBACK_VOCAL] if v[4] != "bp_poly"}
+    reliable, total = 0, 0
     for f in files:
         try:
             pm = pretty_midi.PrettyMIDI(str(f))
@@ -513,29 +683,46 @@ def verify(dest: Path, duration: float | None) -> tuple[list[str], bool]:
             lines.append(f"{f.stem:<24} okunamadı: {e}")
             ok = False
             continue
-        notes = [n for i in pm.instruments for n in i.notes]
+        notes = [(n.start, n.end, n.pitch, n.velocity) for i in pm.instruments for n in i.notes]
         if not notes:
-            lines.append(f"{f.stem:<24} {0:>6} {'-':>9} {'-':>7} {'-':>6}  SORUN: boş")
+            lines.append(f"{f.stem:<24} {0:>6}  SORUN: boş")
             ok = False
             continue
-        lo, hi = min(n.pitch for n in notes), max(n.pitch for n in notes)
-        last = max(n.end for n in notes)
-        problems, notes_ = [], []
-        if duration and last > duration + 1.0:
-            problems.append(f"şarkı süresini aşıyor ({last:.1f}s)")
-        if f.stem == "04_Bas" and np.median([n.pitch for n in notes]) > 60:
+        lo, hi = min(n[2] for n in notes), max(n[2] for n in notes)
+        problems = []
+        if duration and max(n[1] for n in notes) > duration + 1.0:
+            problems.append("şarkı süresini aşıyor")
+        if f.stem == "04_Bas" and np.median([n[2] for n in notes]) > 60:
             problems.append("bas notaları çok tiz")
-        score = "-"
-        wav = dest / f"{f.stem}.wav"
-        if wav.exists() and f.stem != "03_Davul":
-            s = match_score(wav, f)
-            score = f"%{s * 100:.0f}"
-            if s < 0.6:
-                notes_.append("uyum düşük, elle kontrol et")
-        status = "SORUN: " + "; ".join(problems) if problems else ("dikkat: " + "; ".join(notes_) if notes_ else "tamam")
+        # puanlar dosyalardan yeniden hesaplanır (çıkarma sırasındaki değerlere güvenilmez)
+        acc, cov = None, None
+        if f.stem == "03_Davul":
+            acc = drum_scores(dest, notes)
+        elif (dest / f"{f.stem}.wav").exists():
+            acc, cov = melodic_scores(dest / f"{f.stem}.wav", notes, f.stem in mono_stems)
+        if acc is not None:
+            total += 1
+            reliable += acc >= RELIABLE
+        if problems:
+            status = "SORUN: " + "; ".join(problems)
+        elif acc is not None and acc < RELIABLE:
+            status = "güvenilmez: hepsi-bir-arada dosyada yok"
+        else:
+            status = "tamam"
         ok = ok and not problems
         rng = f"{pretty_midi.note_number_to_name(lo)}-{pretty_midi.note_number_to_name(hi)}"
-        lines.append(f"{f.stem:<24} {len(notes):>6} {rng:>9} {last:>6.1f}s {score:>6}  {status}")
+        a = f"%{acc * 100:.1f}" if acc is not None else "-"
+        c = f"%{cov * 100:.0f}" if cov is not None else "-"
+        lines.append(f"{f.stem:<24} {len(notes):>6} {rng:>9} {a:>9} {c:>8}  {status}")
+
+    sc = dest / "MIDI" / "_puanlar.json"
+    if sc.exists():
+        parts = {k: v for k, v in json.loads(sc.read_text(encoding="utf-8")).items() if k.startswith("03_Davul/")}
+        if parts:
+            lines.append("Davul parçaları: " + ", ".join(
+                f"{k[9:]} %{v['dogruluk'] * 100:.0f}" + ("" if v["dogruluk"] >= RELIABLE else " (çıkarıldı)")
+                for k, v in parts.items()))
+    lines.append(f"Güvenilir iz: {reliable}/{total} (doğruluk >= %{RELIABLE * 100:.0f})")
     return lines, ok
 
 
